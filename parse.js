@@ -39,7 +39,7 @@ const numericReference = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
 const numericReferenceOrAmp = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
 
 function decodeNumericReferences(text) {
-  if (!numericReference.test(text)) return text;
+  if (text.indexOf('&') === -1 || !numericReference.test(text)) return text;
   // A decoded character must not join its neighbours into a new reference, so
   // every remaining `&` that cannot start one is escaped on the same pass.
   return text.replace(numericReferenceOrAmp, (ref, dec, hex) => {
@@ -52,7 +52,12 @@ function decodeNumericReferences(text) {
   });
 }
 
+const uriSafe = /^[A-Za-z0-9!#$&'()*+,\-./:;=?@_~%]*$/;
+
 function cleanUrl(href) {
+  // encodeURI leaves these characters alone, and `%` round-trips through the
+  // replacement below, so the common URL costs no encoding call at all.
+  if (uriSafe.test(href)) return href;
   try {
     return encodeURI(href).replace(/%25/g, '%');
   } catch {
@@ -239,7 +244,15 @@ const cachedIndent = (build) => {
   };
 };
 
-const listItemRegex = (bull) => new RegExp(`^( {0,3}${bull})((?:[\\t ][^\\n]*)?(?:\\n|$))`);
+const listItemRegexCache = new Map();
+const listItemRegex = (bull) => {
+  let regex = listItemRegexCache.get(bull);
+  if (!regex) {
+    regex = new RegExp(`^( {0,3}${bull})((?:[\\t ][^\\n]*)?(?:\\n|$))`);
+    listItemRegexCache.set(bull, regex);
+  }
+  return regex;
+};
 const nextBulletRegex = cachedIndent((n) => new RegExp(`^ {0,${n}}(?:[*+-]|\\d{1,9}[.)])((?:[ \\t][^\\n]*)?(?:\\n|$))`));
 const hrRegex = cachedIndent((n) => new RegExp(`^ {0,${n}}((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})(?:\\n+|$)`));
 const fencesBeginRegex = cachedIndent((n) => new RegExp(`^ {0,${n}}(?:\`\`\`|~~~)`));
@@ -486,10 +499,12 @@ function tokenizeList(lex, src) {
     const itemStart = taken();
     src = src.substring(cap[0].length);
 
-    const firstLine = cap[2].split('\n', 1)[0];
+    const firstNewline = cap[2].indexOf('\n');
+    const firstLine = firstNewline === -1 ? cap[2] : cap[2].slice(0, firstNewline);
     const bulletIndent = cap[1].length;
     let line = firstLine.replace(other.leadingSpaceTab, (space) => expandTabs(space, bulletIndent));
-    let nextLine = src.split('\n', 1)[0];
+    const nextNewline = src.indexOf('\n');
+    let nextLine = nextNewline === -1 ? src : src.slice(0, nextNewline);
     let blankLine = !line.trim();
 
     let indent;
@@ -516,18 +531,35 @@ function tokenizeList(lex, src) {
       const blockquoteBegin = blockquoteBeginRegex(indent);
 
       while (src) {
-        const rawLine = src.split('\n', 1)[0];
+        const newline = src.indexOf('\n');
+        const rawLine = newline === -1 ? src : src.slice(0, newline);
         nextLine = rawLine;
-        const nextLineWithoutTabs = nextLine.replace(other.leadingSpaceTab, (space) => expandTabs(space));
+        const nextLineWithoutTabs = nextLine.indexOf('\t') === -1
+          ? nextLine
+          : nextLine.replace(other.leadingSpaceTab, (space) => expandTabs(space));
 
-        if (fencesBegin.test(nextLine)) break;
-        if (headingBegin.test(nextLine)) break;
-        if (htmlBegin.test(nextLine)) break;
-        if (blockquoteBegin.test(nextLine)) break;
-        if (nextBullet.test(nextLine)) break;
-        if (hr.test(nextLine)) break;
+        // Only a run of at most `indent` spaces followed by one of these
+        // characters can match any of the block-start regexes below.
+        let p = 0;
+        while (p <= indent && nextLine.charCodeAt(p) === 32) p++;
+        const first = p <= indent ? nextLine.charCodeAt(p) : -1;
+        if (first === 96 || first === 126) {
+          if (fencesBegin.test(nextLine)) break;
+        } else if (first === 35) {
+          if (headingBegin.test(nextLine)) break;
+        } else if (first === 60) {
+          if (htmlBegin.test(nextLine)) break;
+        } else if (first === 62) {
+          if (blockquoteBegin.test(nextLine)) break;
+        } else if (first === 42 || first === 43 || first === 45 || (first >= 48 && first <= 57)) {
+          if (nextBullet.test(nextLine)) break;
+          if ((first === 42 || first === 45) && hr.test(nextLine)) break;
+        } else if (first === 95) {
+          if (hr.test(nextLine)) break;
+        }
 
-        if (nextLineWithoutTabs.search(other.nonSpaceChar) >= indent || !nextLine.trim()) {
+        const blank = !nextLine.trim();
+        if (nextLineWithoutTabs.search(other.nonSpaceChar) >= indent || blank) {
           itemContents += '\n' + nextLineWithoutTabs.slice(indent);
         } else {
           if (blankLine) break;
@@ -547,7 +579,7 @@ function tokenizeList(lex, src) {
           itemContents += '\n' + continuation;
         }
 
-        blankLine = !nextLine.trim();
+        blankLine = blank;
         src = src.substring(rawLine.length + 1);
         line = nextLineWithoutTabs.slice(indent);
       }
@@ -667,7 +699,18 @@ function tokenizeDef(src) {
   return { type: 'def', tag, raw: rtrimChars(cap[0], '\n'), href, title };
 }
 
+const tableDelimMaybe = /^ {0,3}[|: -]*-[|: -]*$/;
+
 function tokenizeTable(lex, src) {
+  // A table delimiter row uses only spaces, pipes, colons and dashes, and must
+  // follow the header line immediately; check that cheaply before the full
+  // table grammar (whose tag alternation is expensive).
+  const headerEnd = src.indexOf('\n');
+  if (headerEnd === -1) return;
+  const rowEnd = src.indexOf('\n', headerEnd + 1);
+  const delimiterRow = src.slice(headerEnd + 1, rowEnd === -1 ? src.length : rowEnd);
+  if (!tableDelimMaybe.test(delimiterRow) || !other.tableDelimiter.test(delimiterRow)) return;
+
   const cap = B.table.exec(src);
   if (!cap || !other.tableDelimiter.test(cap[2])) return;
 
@@ -713,7 +756,12 @@ function tokenizeTable(lex, src) {
   return token;
 }
 
+const setextMaybe = /\n {0,3}[=-]/;
+
 function tokenizeLheading(lex, src) {
+  // A setext underline is the only way lheading can match; the full grammar is
+  // a large alternation, so look for that underline first.
+  if (!setextMaybe.test(src)) return;
   const cap = B.lheading.exec(src);
   if (cap) {
     const text = cap[1].trim();
@@ -946,6 +994,9 @@ function linkInText(lex, text) {
 }
 
 function maskSource(lex, src) {
+  // None of the masks can match without one of these characters.
+  if (src.indexOf('\\') === -1 && src.indexOf('`') === -1
+    && src.indexOf('[') === -1 && src.indexOf('<') === -1) return src;
   let maskedSrc = src;
 
   if (src.includes('[')) {
@@ -966,34 +1017,44 @@ function maskSource(lex, src) {
 
   // Every mask keeps the length of what it replaces, because emStrong and del
   // line maskedSrc up with src by slicing from the end.
-  maskedSrc = maskedSrc.replace(I.anyPunctuationOutsideCode, (m0, code, punct) => {
-    if (punct) return '+'.repeat(m0.length);
-    if (code) return code + m0.slice(code.length, -code.length).replace(/`/g, '+') + code;
-    return m0;
-  });
+  if (maskedSrc.indexOf('`') !== -1 || maskedSrc.indexOf('\\') !== -1) {
+    maskedSrc = maskedSrc.replace(I.anyPunctuationOutsideCode, (m0, code, punct) => {
+      if (punct) return '+'.repeat(m0.length);
+      if (code) return code + m0.slice(code.length, -code.length).replace(/`/g, '+') + code;
+      return m0;
+    });
+  }
 
-  maskedSrc = maskedSrc.replace(I.blockSkip, (m0, _link, context) => {
-    const offset = context ? context.length : 0;
-    return m0.slice(0, offset) + '[' + 'a'.repeat(m0.length - offset - 2) + ']';
-  });
+  // blockSkip only covers bracketed links, code spans and raw HTML tags.
+  if (maskedSrc.indexOf('[') !== -1 || maskedSrc.indexOf('`') !== -1 || maskedSrc.indexOf('<') !== -1) {
+    maskedSrc = maskedSrc.replace(I.blockSkip, (m0, _link, context) => {
+      const offset = context ? context.length : 0;
+      return m0.slice(0, offset) + '[' + 'a'.repeat(m0.length - offset - 2) + ']';
+    });
+  }
 
   return maskedSrc;
 }
+
+const EMPTY_HINTS = { src: '', em: { '*': -1, _: -1 }, del: -1 };
 
 function inlineTokens(lex, src, tokens = []) {
   const outerParenPossible = lex.state.linkParenPossible;
   lex.state.linkParenPossible = outerParenPossible && src.includes(')');
   const needsMask = src.includes('*') || src.includes('_') || src.includes('~');
-  const maskedSrc = needsMask ? maskSource(lex, src) : src;
+  if (!needsMask) {
+    const result = tokenizeInlines(lex, src, src, tokens);
+    lex.state.linkParenPossible = outerParenPossible;
+    return result;
+  }
+  const maskedSrc = maskSource(lex, src);
 
   const frame = scanCloserHints(maskedSrc);
   lex.hints.push(frame);
-  try {
-    return tokenizeInlines(lex, src, maskedSrc, tokens);
-  } finally {
-    lex.hints.pop();
-    lex.state.linkParenPossible = outerParenPossible;
-  }
+  const result = tokenizeInlines(lex, src, maskedSrc, tokens);
+  lex.hints.pop();
+  lex.state.linkParenPossible = outerParenPossible;
+  return result;
 }
 
 function tokenizeInlines(lex, src, maskedSrc, tokens) {
@@ -1012,97 +1073,76 @@ function tokenizeInlines(lex, src, maskedSrc, tokens) {
     if (!keepPrevChar) prevChar = '';
     keepPrevChar = false;
 
-    let token = tokenizeEscape(src);
-    if (token) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
+    // Dispatch on the next character: every tokenizer below is anchored at ^,
+    // so most of them cannot match unless the first character agrees.
+    const c = src.charCodeAt(0);
+    let token;
+    let merge = 0;
+    switch (c) {
+      case 92: // backslash
+        token = tokenizeEscape(src);
+        if (!token) token = tokenizeBr(src);
+        break;
+      case 60: // <
+        token = tokenizeTag(lex, src);
+        if (!token) token = tokenizeAutolink(src);
+        break;
+      case 91: // [
+        token = tokenizeLink(lex, src);
+        if (!token) {
+          token = tokenizeReflink(lex, src);
+          merge = 1;
+        }
+        break;
+      case 33: // !
+        if (src.charCodeAt(1) === 91) {
+          token = tokenizeLink(lex, src);
+          if (!token) {
+            token = tokenizeReflink(lex, src);
+            merge = 1;
+          }
+        }
+        break;
+      case 42: // *
+      case 95: // _
+        token = tokenizeEmStrong(lex, src, maskedSrc, prevChar);
+        break;
+      case 96: // `
+        token = tokenizeCodespan(src);
+        break;
+      case 126: // ~
+        token = tokenizeDel(lex, src, maskedSrc, prevChar);
+        break;
+      case 32: // space
+        token = tokenizeBr(src);
+        break;
+      default:
+        if (!lex.state.inLink) token = tokenizeUrl(src);
+        break;
     }
 
-    token = tokenizeTag(lex, src);
-    if (token) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    token = tokenizeLink(lex, src);
-    if (token) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    token = tokenizeReflink(lex, src);
-    if (token) {
-      src = src.substring(token.raw.length);
-      const lastToken = tokens[tokens.length - 1];
-      if (token.type === 'text' && lastToken && lastToken.type === 'text') {
-        lastToken.raw += token.raw;
-        lastToken.text += token.text;
-      } else {
-        tokens.push(token);
+    if (!token) {
+      token = tokenizeInlineText(lex, src);
+      if (!token) {
+        src = src.substring(1);
+        continue;
       }
-      continue;
+      merge = 2;
     }
 
-    token = tokenizeEmStrong(lex, src, maskedSrc, prevChar);
-    if (token) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    token = tokenizeCodespan(src);
-    if (token) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    token = tokenizeBr(src);
-    if (token) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    token = tokenizeDel(lex, src, maskedSrc, prevChar);
-    if (token) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    token = tokenizeAutolink(src);
-    if (token) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    if (!lex.state.inLink && (token = tokenizeUrl(src))) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    token = tokenizeInlineText(lex, src);
-    if (token) {
-      src = src.substring(token.raw.length);
+    src = src.substring(token.raw.length);
+    if (merge === 2) {
       if (token.raw.slice(-1) !== '_') prevChar = token.raw.slice(-1);
       keepPrevChar = true;
-      const lastToken = tokens[tokens.length - 1];
-      if (lastToken && lastToken.type === 'text') {
-        lastToken.raw += token.raw;
-        lastToken.text += token.text;
-      } else {
-        tokens.push(token);
-      }
-      continue;
     }
-
-    src = src.substring(1);
+    const lastToken = tokens[tokens.length - 1];
+    if (merge !== 0 && token.type === 'text' && lastToken && lastToken.type === 'text') {
+      lastToken.raw += token.raw;
+      lastToken.text += token.text;
+    } else {
+      tokens.push(token);
+    }
+    continue;
   }
 
   return tokens;
@@ -1435,7 +1475,32 @@ function tokenizeUrl(src) {
   };
 }
 
+// The earliest position at which marked's inline text grammar can stop: any of
+// its delimiter characters, an autolink protocol, or a bare `www.` at a word
+// boundary. A plain-text run can be cut there without running the large
+// I.text grammar over it.
+const textStop = /[\\<!\[`*~_]|[hH][tT][tT][pP]|[fF][tT][tT][pP]:\/\/|(?<![^\s*_~(])www\.|(?= {2,}\n)/;
+
 function tokenizeInlineText(lex, src) {
+  const stop = textStop.exec(src);
+  const end = stop ? stop.index : src.length;
+
+  if (end > 0) {
+    // The email, mailto: and xmpp: boundaries need a little more context; let
+    // the regex handle those rare cases.
+    const window = end + 8 >= src.length ? src : src.slice(0, end + 8);
+    if (window.indexOf('@') === -1 && window.indexOf('mailto:') === -1 && window.indexOf('xmpp:') === -1) {
+      const raw = end === src.length ? src : src.slice(0, end);
+      const escaped = lex.state.inRawBlock;
+      return {
+        type: 'text',
+        raw,
+        text: escaped ? raw : decodeNumericReferences(raw),
+        escaped,
+      };
+    }
+  }
+
   const cap = I.text.exec(src);
   if (cap) {
     const escaped = lex.state.inRawBlock;
@@ -1640,7 +1705,7 @@ function renderBlocks(tokens) {
 
 /** Render `markdown` exactly as marked 18.1.3 does with default options. */
 export function parse(markdown) {
-  const src = markdown.replace(/\r\n|\r/g, '\n');
+  const src = markdown.indexOf('\r') === -1 ? markdown : markdown.replace(/\r\n|\r/g, '\n');
   const lex = newLexer();
 
   blockTokens(lex, src, lex.tokens);
